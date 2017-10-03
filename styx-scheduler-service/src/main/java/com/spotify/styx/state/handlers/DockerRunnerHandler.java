@@ -126,7 +126,7 @@ public class DockerRunnerHandler implements OutputHandler {
     // they transitioned through a SUBMITTING state that did not create execution IDs. This execution ID
     // will be added to the RunState through the submitted event.
     final String executionId = state.data().executionId()
-        .orElseGet(ExecutionDescriptionHandler::createExecutionId);
+        .orElseGet(ExecutionPreparationHandler::createExecutionId);
 
     final String dockerImage = executionDescription.dockerImage();
     final List<String> dockerArgs = executionDescription.dockerArgs();

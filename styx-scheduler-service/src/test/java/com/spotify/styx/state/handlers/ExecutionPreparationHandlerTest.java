@@ -37,15 +37,18 @@ import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.anyString;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableList;
+import com.spotify.styx.WorkflowExecutionGate;
 import com.spotify.styx.model.Event;
 import com.spotify.styx.model.Workflow;
 import com.spotify.styx.model.WorkflowConfiguration;
 import com.spotify.styx.model.WorkflowId;
 import com.spotify.styx.model.WorkflowInstance;
 import com.spotify.styx.model.WorkflowState;
+import com.spotify.styx.state.Message;
 import com.spotify.styx.state.RunState;
 import com.spotify.styx.state.StateData;
 import com.spotify.styx.state.StateManager;
@@ -53,10 +56,13 @@ import com.spotify.styx.state.SyncStateManager;
 import com.spotify.styx.state.Trigger;
 import com.spotify.styx.storage.InMemStorage;
 import com.spotify.styx.storage.Storage;
+import com.spotify.styx.testdata.TestData;
 import com.spotify.styx.util.DockerImageValidator;
 import com.spotify.styx.util.IsClosedException;
 import java.io.IOException;
 import java.util.Collections;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 import org.hamcrest.Matchers;
 import org.junit.Before;
 import org.junit.Test;
@@ -65,7 +71,7 @@ import org.mockito.Mock;
 import org.mockito.runners.MockitoJUnitRunner;
 
 @RunWith(MockitoJUnitRunner.class)
-public class ExecutionDescriptionHandlerTest {
+public class ExecutionPreparationHandlerTest {
 
   private static final String DOCKER_IMAGE = "my_docker_image";
   private static final String COMMIT_SHA = "71d70fca99e29812e81d1ed0a5c9d3559f4118e9";
@@ -73,16 +79,18 @@ public class ExecutionDescriptionHandlerTest {
 
   private Storage storage;
   private StateManager stateManager;
-  private ExecutionDescriptionHandler toTest;
+  private ExecutionPreparationHandler toTest;
 
   @Mock DockerImageValidator dockerImageValidator;
+  @Mock WorkflowExecutionGate executionGate;
 
   @Before
   public void setUp() throws Exception {
     when(dockerImageValidator.validateImageReference(anyString())).thenReturn(Collections.emptyList());
+    when(executionGate.missingDependencies(any(), any(), any())).thenReturn(Collections.emptyList());
     storage = new InMemStorage();
     stateManager = spy(new SyncStateManager());
-    toTest = new ExecutionDescriptionHandler(storage, stateManager, dockerImageValidator);
+    toTest = new ExecutionPreparationHandler(storage, stateManager, dockerImageValidator, executionGate);
   }
 
   @Test
@@ -159,7 +167,7 @@ public class ExecutionDescriptionHandlerTest {
     storageSpy.storeWorkflow(workflow);
     storageSpy.patchState(workflow.id(), workflowState);
 
-    toTest = new ExecutionDescriptionHandler(storageSpy, stateManager, dockerImageValidator);
+    toTest = new ExecutionPreparationHandler(storageSpy, stateManager, dockerImageValidator, executionGate);
 
     RunState runState = RunState.fresh(workflowInstance, toTest);
 
@@ -265,6 +273,22 @@ public class ExecutionDescriptionHandlerTest {
 
     assertThat(currentState.state(), is(PREPARE));
     assertFalse(data.executionDescription().isPresent());
+  }
+
+  @Test
+  public void shouldRetryLaterIfMissingDependencies() throws Exception {
+    when(executionGate.missingDependencies(any(), any(), any())).thenReturn(ImmutableList.of("foo", "bar"));
+
+    Workflow workflow = Workflow.create("id", FULL_WORKFLOW_CONFIGURATION);
+    WorkflowInstance workflowInstance = WorkflowInstance.create(workflow.id(), "2016-03-14T15");
+    RunState runState = RunState.create(workflowInstance, RunState.State.PREPARE);
+
+    storage.storeWorkflow(workflow);
+    stateManager.initialize(runState);
+    toTest.transitionInto(runState);
+
+    verify(stateManager).receive(Event.info(workflowInstance, Message.info("Missing dependencies: foo, bar")));
+    verify(stateManager).receive(Event.retryAfter(workflowInstance, TimeUnit.MINUTES.toMillis(10)));
   }
 
   private WorkflowConfiguration schedule(String... args) {

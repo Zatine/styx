@@ -190,17 +190,11 @@ public abstract class RunState {
 
     @Override
     public RunState info(WorkflowInstance workflowInstance, Message message) {
-      switch (state()) {
-        case QUEUED:
-          return state(
-              QUEUED,
-              data().builder()
-                  .addMessage(message)
-                  .build());
-
-        default:
-          throw illegalTransition("info");
-      }
+      return state(
+          state(),
+          data().builder()
+              .addMessage(message)
+              .build());
     }
 
     @Override
@@ -351,6 +345,7 @@ public abstract class RunState {
     @Override
     public RunState retryAfter(WorkflowInstance workflowInstance, long delayMillis) {
       switch (state()) {
+        case PREPARE:
         case TERMINATED:
         case FAILED:
           return state(

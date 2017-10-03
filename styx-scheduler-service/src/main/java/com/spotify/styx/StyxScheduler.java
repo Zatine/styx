@@ -73,7 +73,7 @@ import com.spotify.styx.state.RunState;
 import com.spotify.styx.state.StateManager;
 import com.spotify.styx.state.TimeoutConfig;
 import com.spotify.styx.state.handlers.DockerRunnerHandler;
-import com.spotify.styx.state.handlers.ExecutionDescriptionHandler;
+import com.spotify.styx.state.handlers.ExecutionPreparationHandler;
 import com.spotify.styx.state.handlers.PublisherHandler;
 import com.spotify.styx.state.handlers.TerminationHandler;
 import com.spotify.styx.storage.AggregateStorage;
@@ -177,6 +177,7 @@ public class StyxScheduler implements AppInit {
     private RetryUtil retryUtil = DEFAULT_RETRY_UTIL;
     private WorkflowResourceDecorator resourceDecorator = WorkflowResourceDecorator.NOOP;
     private EventConsumerFactory eventConsumerFactory = (env) -> (event) -> { };
+    private WorkflowExecutionGate executionGate = WorkflowExecutionGate.NOOP;
 
     public Builder setTime(Time time) {
       this.time = time;
@@ -228,6 +229,11 @@ public class StyxScheduler implements AppInit {
       return this;
     }
 
+    public Builder setExecutionGate(WorkflowExecutionGate executionGate) {
+      this.executionGate = executionGate;
+      return this;
+    }
+
     public StyxScheduler build() {
       return new StyxScheduler(this);
     }
@@ -253,6 +259,8 @@ public class StyxScheduler implements AppInit {
   private final RetryUtil retryUtil;
   private final WorkflowResourceDecorator resourceDecorator;
   private final EventConsumerFactory eventConsumerFactory;
+  private final WorkflowExecutionGate executionGate;
+
 
   private StateManager stateManager;
   private Scheduler scheduler;
@@ -270,6 +278,7 @@ public class StyxScheduler implements AppInit {
     this.retryUtil = requireNonNull(builder.retryUtil);
     this.resourceDecorator = requireNonNull(builder.resourceDecorator);
     this.eventConsumerFactory = requireNonNull(builder.eventConsumerFactory);
+    this.executionGate = requireNonNull(builder.executionGate);
   }
 
   @Override
@@ -329,7 +338,7 @@ public class StyxScheduler implements AppInit {
         new TerminationHandler(retryUtil, stateManager),
         new MonitoringHandler(time, stats),
         new PublisherHandler(publisher),
-        new ExecutionDescriptionHandler(storage, stateManager, new DockerImageValidator())
+        new ExecutionPreparationHandler(storage, stateManager, new DockerImageValidator(), executionGate)
     };
     final StateFactory stateFactory =
         (workflowInstance) -> RunState.fresh(workflowInstance, time, outputHandlers);

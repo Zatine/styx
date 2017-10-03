@@ -20,15 +20,18 @@
 
 package com.spotify.styx.state.handlers;
 
+import static com.spotify.styx.state.handlers.TerminationHandler.MISSING_DEPS_RETRY_DELAY_MINUTES;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 
+import com.spotify.styx.WorkflowExecutionGate;
 import com.spotify.styx.model.Event;
 import com.spotify.styx.model.ExecutionDescription;
 import com.spotify.styx.model.Workflow;
 import com.spotify.styx.model.WorkflowId;
 import com.spotify.styx.model.WorkflowInstance;
 import com.spotify.styx.model.WorkflowState;
+import com.spotify.styx.state.Message;
 import com.spotify.styx.state.OutputHandler;
 import com.spotify.styx.state.RunState;
 import com.spotify.styx.state.StateManager;
@@ -43,26 +46,31 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class ExecutionDescriptionHandler implements OutputHandler {
+public class ExecutionPreparationHandler implements OutputHandler {
 
-  private static final Logger LOG = LoggerFactory.getLogger(ExecutionDescriptionHandler.class);
+  private static final Logger LOG = LoggerFactory.getLogger(ExecutionPreparationHandler.class);
 
   private static final String STYX_RUN = "styx-run";
 
   private final Storage storage;
   private final StateManager stateManager;
   private final DockerImageValidator dockerImageValidator;
+  private final WorkflowExecutionGate gate;
 
-  public ExecutionDescriptionHandler(
+  public ExecutionPreparationHandler(
       Storage storage,
       StateManager stateManager,
-      DockerImageValidator dockerImageValidator) {
+      DockerImageValidator dockerImageValidator,
+      WorkflowExecutionGate gate) {
     this.storage = requireNonNull(storage);
     this.stateManager = requireNonNull(stateManager);
     this.dockerImageValidator = requireNonNull(dockerImageValidator);
+    this.gate = requireNonNull(gate, "gate");
   }
 
   @Override
@@ -71,22 +79,19 @@ public class ExecutionDescriptionHandler implements OutputHandler {
 
     switch (state.state()) {
       case PREPARE:
+        final ExecutionDescription execDescription;
         try {
-          final Event submitEvent = Event.submit(
-              state.workflowInstance(), getExecDescription(workflowInstance), createExecutionId());
-          try {
-            stateManager.receive(submitEvent);
-          } catch (IsClosedException isClosedException) {
-            LOG.warn("Could not send 'submit' event", isClosedException);
-          }
+          execDescription = getExecDescription(workflowInstance);
         } catch (ResourceNotFoundException e) {
           LOG.info("Workflow {} does not exist, halting {}", workflowInstance.workflowId(),
                    workflowInstance);
           stateManager.receiveIgnoreClosed(Event.halt(workflowInstance));
+          return;
         } catch (MissingRequiredPropertyException e) {
           LOG.warn("Failed to prepare execution description for "
                    + state.workflowInstance().toKey(), e);
           stateManager.receiveIgnoreClosed(Event.halt(workflowInstance));
+          return;
         } catch (IOException e) {
           try {
             LOG.error("Failed to retrieve execution description for " + state.workflowInstance().toKey(), e);
@@ -94,6 +99,28 @@ public class ExecutionDescriptionHandler implements OutputHandler {
           } catch (IsClosedException isClosedException) {
             LOG.warn("Failed to send 'runError' event", isClosedException);
           }
+          return;
+        }
+
+        // Check for missing dependencies before submitting
+        // TODO (dano): Should this be done by the scheduler before dequeuing instead of in the state machine?
+        final Collection<String> missingDependencies = gate.missingDependencies(
+            workflowInstance, state, execDescription);
+        if (!missingDependencies.isEmpty()) {
+          stateManager.receiveIgnoreClosed(Event.info(workflowInstance, Message.info(
+              "Missing dependencies: " + missingDependencies.stream().collect(Collectors.joining(", ")))));
+          stateManager.receiveIgnoreClosed(Event.retryAfter(
+              workflowInstance, TimeUnit.MINUTES.toMillis(MISSING_DEPS_RETRY_DELAY_MINUTES)));
+          return;
+        }
+
+        // We have all dependencies that we know about, submit!
+        final Event submitEvent = Event.submit(
+            state.workflowInstance(), execDescription, createExecutionId());
+        try {
+          stateManager.receive(submitEvent);
+        } catch (IsClosedException isClosed) {
+          LOG.warn("Could not send 'submit' event", isClosed);
         }
         break;
 
