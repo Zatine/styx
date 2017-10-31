@@ -345,6 +345,7 @@ public abstract class RunState {
     @Override
     public RunState retryAfter(WorkflowInstance workflowInstance, long delayMillis) {
       switch (state()) {
+        case QUEUED:
         case PREPARE:
         case TERMINATED:
         case FAILED:

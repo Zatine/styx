@@ -20,6 +20,9 @@
 
 package com.spotify.styx;
 
+import static com.spotify.styx.WorkflowExecutionGate.NO_MISSING_DEPS;
+import static com.spotify.styx.state.handlers.TerminationHandler.MISSING_DEPS_RETRY_DELAY_MINUTES;
+import static com.spotify.styx.util.TimeUtil.nextInstant;
 import static java.util.Collections.emptySet;
 import static java.util.function.Function.identity;
 import static java.util.stream.Collectors.counting;
@@ -36,8 +39,11 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.RateLimiter;
 import com.spotify.styx.model.Event;
+import com.spotify.styx.model.EventVisitorAdapter;
 import com.spotify.styx.model.Resource;
+import com.spotify.styx.model.SequenceEvent;
 import com.spotify.styx.model.Workflow;
+import com.spotify.styx.model.WorkflowConfiguration;
 import com.spotify.styx.model.WorkflowId;
 import com.spotify.styx.model.WorkflowInstance;
 import com.spotify.styx.monitoring.Stats;
@@ -56,8 +62,15 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.SortedSet;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import javaslang.Tuple;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -82,6 +95,8 @@ public class Scheduler {
   @VisibleForTesting
   static final String GLOBAL_RESOURCE_ID = "GLOBAL_STYX_CLUSTER";
 
+  private static final int SCHEDULING_BATCH_SIZE = 32;
+
   private final Time time;
   private final TimeoutConfig ttls;
   private final StateManager stateManager;
@@ -90,11 +105,12 @@ public class Scheduler {
   private final WorkflowResourceDecorator resourceDecorator;
   private final Stats stats;
   private final RateLimiter dequeueRateLimiter;
+  private final WorkflowExecutionGate gate;
 
   public Scheduler(Time time, TimeoutConfig ttls, StateManager stateManager,
       WorkflowCache workflowCache, Storage storage,
       WorkflowResourceDecorator resourceDecorator,
-      Stats stats, RateLimiter dequeueRateLimiter) {
+      Stats stats, RateLimiter dequeueRateLimiter, WorkflowExecutionGate gate) {
     this.time = Objects.requireNonNull(time);
     this.ttls = Objects.requireNonNull(ttls);
     this.stateManager = Objects.requireNonNull(stateManager);
@@ -103,6 +119,7 @@ public class Scheduler {
     this.resourceDecorator = Objects.requireNonNull(resourceDecorator);
     this.stats = Objects.requireNonNull(stats);
     this.dequeueRateLimiter = Objects.requireNonNull(dequeueRateLimiter, "dequeueRateLimiter");
+    this.gate = gate;
   }
 
   void tick() {
@@ -150,6 +167,8 @@ public class Scheduler {
                 ConcurrentHashMap::new,
                 counting()));
 
+    timedOutInstances.forEach(this::sendTimeout);
+
     final List<InstanceState> eligibleInstances =
         activeStates.parallelStream()
             .filter(entry -> !timedOutInstances.contains(entry.workflowInstance()))
@@ -157,17 +176,65 @@ public class Scheduler {
             .collect(toCollection(Lists::newArrayList));
     Collections.shuffle(eligibleInstances);
 
-    timedOutInstances.forEach(this::sendTimeout);
+    final Map<WorkflowId, Optional<Workflow>> workflows = eligibleInstances.stream()
+        .map(i -> i.workflowInstance().workflowId())
+        .distinct()
+        .collect(toMap(id -> id, workflowCache::workflow));
 
-    for (InstanceState eligibleInstance : eligibleInstances) {
-      final boolean proceed = limitAndDequeue(
-          resources, workflowResourceReferences, currentResourceUsage, eligibleInstance);
-      if (!proceed) {
-        break;
+    for (List<InstanceState> batch : Lists.partition(eligibleInstances, SCHEDULING_BATCH_SIZE)) {
+
+      final Map<WorkflowInstance, SortedSet<SequenceEvent>> batchEvents =
+          eligibleInstances.parallelStream()
+              .collect(toMap(InstanceState::workflowInstance, (InstanceState i) -> {
+                try {
+                  return storage.readEvents(i.workflowInstance());
+                } catch (IOException e) {
+                  throw new RuntimeException(e);
+                }
+              }));
+
+      final Map<WorkflowInstance, CompletableFuture<List<String>>> batchMissingDependencies =
+          eligibleInstances.stream()
+              .map(i -> Tuple.of(i, workflows.get(i.workflowInstance().workflowId())))
+              .filter(i -> i._2().isPresent())
+              .filter(i -> shouldCheckDependencies(
+                  i._2().get().configuration(), batchEvents.get(i._1.workflowInstance())))
+              .collect(toMap(
+                  i -> i._1.workflowInstance(),
+                  i -> gate.missingDependencies(
+                      i._1.workflowInstance(), i._2.get().configuration(), i._1.runState())
+              ));
+
+      for (InstanceState instance : batch) {
+        final boolean proceed = limitAndDequeue(
+            resources, workflowResourceReferences, currentResourceUsage, instance,
+            batchMissingDependencies.getOrDefault(instance.workflowInstance(), NO_MISSING_DEPS));
+        if (!proceed) {
+          break;
+        }
       }
     }
 
     updateStats(resources, currentResourceUsage);
+  }
+
+  private boolean shouldCheckDependencies(WorkflowConfiguration configuration, SortedSet<SequenceEvent> events) {
+    final Instant lastDequeue = events.stream()
+        .map(event -> event.event().accept(new EventVisitorAdapter<Instant>() {
+          @Override
+          public Instant dequeue(WorkflowInstance workflowInstance) {
+            return Instant.ofEpochMilli(event.timestamp());
+          }
+        }))
+        .filter(Objects::nonNull)
+        .reduce(null, (a, b) -> b);
+
+    if (lastDequeue == null) {
+      return true;
+    }
+
+    // Check dependencies unless the last dequeue was more than a schedule interval ago
+    return time.get().isBefore(nextInstant(lastDequeue, configuration.schedule()));
   }
 
   private void updateStats(Map<String, Resource> resources,
@@ -180,13 +247,41 @@ public class Scheduler {
 
   private boolean limitAndDequeue(Map<String, Resource> resources,
       Map<WorkflowId, Set<String>> workflowResourceReferences,
-      Map<String, Long> currentResourceUsage, InstanceState instance) {
+      Map<String, Long> currentResourceUsage, InstanceState instance,
+      CompletableFuture<List<String>> missingDependenciesFuture) {
+
+    // Check for missing dependencies
+    final List<String> missingDependencies;
+    try {
+      missingDependencies = missingDependenciesFuture.get(30, TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      LOG.debug("Interrupted");
+      return true;
+    } catch (ExecutionException | TimeoutException e) {
+      LOG.error("Failed to check for missing dependencies", e);
+      return true;
+    }
+
+    if (!missingDependencies.isEmpty()) {
+
+      stateManager.receiveIgnoreClosed(Event.info(instance.workflowInstance(), Message.info(
+          "Missing dependencies: " + missingDependencies.stream()
+              .collect(Collectors.joining(", ")))));
+      stateManager.receiveIgnoreClosed(Event.retryAfter(
+          instance.workflowInstance(),
+          TimeUnit.MINUTES.toMillis(MISSING_DEPS_RETRY_DELAY_MINUTES)));
+      LOG.debug("Dequeue rescheduled, missing dependencies: {}: {}",
+          instance.workflowInstance(), missingDependencies);
+      return true;
+    }
+
     final Set<String> workflowResourceRefs =
         workflowResourceReferences.getOrDefault(instance.workflowInstance().workflowId(), emptySet());
 
-    final Set<String> instanceResourceRefs = workflowCache.workflow(instance.workflowInstance().workflowId())
-        .map(workflow -> resourceDecorator.decorateResources(
-            instance.runState(), workflow.configuration(), workflowResourceRefs))
+    final Set<String> instanceResourceRefs = workflowCache
+        .workflow(instance.workflowInstance().workflowId())
+        .map(wf -> resourceDecorator.decorateResources(
+            instance.runState(), wf.configuration(), workflowResourceRefs))
         .orElse(workflowResourceRefs);
 
     final Set<String> unknownResources = instanceResourceRefs.stream()

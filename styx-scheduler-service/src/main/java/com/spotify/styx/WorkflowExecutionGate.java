@@ -22,31 +22,37 @@ package com.spotify.styx;
 
 
 import com.spotify.styx.model.ExecutionDescription;
+import com.spotify.styx.model.WorkflowConfiguration;
 import com.spotify.styx.model.WorkflowInstance;
 import com.spotify.styx.state.RunState;
-import java.util.Collection;
 import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 public interface WorkflowExecutionGate {
 
-  /**
-   * Check for known missing dependencies of a workflow instance. This method is called before the workflow container
-   * itself is executed, in order to provide an opportunity to perform cheaper dependency lookup. Implementations of
-   * this method should be careful to consider whether dependency information gathered e.g. from previous executions has
-   * been invalidated by docker image and/or args changes, etc.
-   *
-   * @param wfi The workflow instance to check dependencies for.
-   * @param preState The {@link RunState} of the workflow instance before the current execution. Contains information
-   *     about the previous execution, like exit code and {@link ExecutionDescription}.
-   * @param executionDescription The {@link ExecutionDescription} of the current execution under consideration.
-   * @return A list of missing dependency resource identifiers, e.g. uris.
-   */
-  Collection<String> missingDependencies(WorkflowInstance wfi, RunState preState,
-      ExecutionDescription executionDescription);
+  CompletableFuture<List<String>> NO_MISSING_DEPS =
+      CompletableFuture.completedFuture(Collections.emptyList());
 
   /**
-   * A nop {@link WorkflowExecutionGate} that never returns any missing dependencies. I.e., the execution can always
-   * proceed.
+   * Check for known missing dependencies of a workflow instance. This method is called before the
+   * workflow instance is dequeued, in order to provide an opportunity to perform cheaper dependency
+   * lookup. Implementations of this method should be careful to consider whether dependency
+   * information gathered e.g. from previous executions has been invalidated by docker image and/or
+   * args changes, etc. This method must not block.
+   *
+   * @param instance The workflow instance to check dependencies for.
+   * @param configuration The {@link WorkflowConfiguration} of the workflow instance.
+   * @param runState The current {@link RunState} of the workflow instance. Contains information
+   *     about the previous execution, like exit code and {@link ExecutionDescription}.
+   * @return A list of missing dependency resource identifiers, e.g. uris.
    */
-  WorkflowExecutionGate NOOP = (wfi, state, ed) -> Collections.emptyList();
+  CompletableFuture<List<String>> missingDependencies(
+      WorkflowInstance instance, WorkflowConfiguration configuration, RunState runState);
+
+  /**
+   * A nop {@link WorkflowExecutionGate} that never returns any missing dependencies. I.e., the
+   * execution can always proceed.
+   */
+  WorkflowExecutionGate NOOP = (wfi, state, storage) -> NO_MISSING_DEPS;
 }

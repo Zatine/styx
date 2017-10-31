@@ -338,7 +338,7 @@ public class StyxScheduler implements AppInit {
         new TerminationHandler(retryUtil, stateManager),
         new MonitoringHandler(time, stats),
         new PublisherHandler(publisher),
-        new ExecutionPreparationHandler(storage, stateManager, new DockerImageValidator(), executionGate)
+        new ExecutionPreparationHandler(storage, stateManager, new DockerImageValidator())
     };
     final StateFactory stateFactory =
         (workflowInstance) -> RunState.fresh(workflowInstance, time, outputHandlers);
@@ -355,7 +355,8 @@ public class StyxScheduler implements AppInit {
         workflowChanged(workflowCache, workflowInitializer, stats, stateManager);
 
     final Scheduler scheduler = new Scheduler(time, timeoutConfig, stateManager, workflowCache,
-                                              storage, resourceDecorator, stats, dequeueRateLimiter);
+                                              storage, resourceDecorator, stats, dequeueRateLimiter,
+        executionGate);
 
     final Cleaner cleaner = new Cleaner(dockerRunner);
 

@@ -82,15 +82,13 @@ public class ExecutionPreparationHandlerTest {
   private ExecutionPreparationHandler toTest;
 
   @Mock DockerImageValidator dockerImageValidator;
-  @Mock WorkflowExecutionGate executionGate;
 
   @Before
   public void setUp() throws Exception {
     when(dockerImageValidator.validateImageReference(anyString())).thenReturn(Collections.emptyList());
-    when(executionGate.missingDependencies(any(), any(), any())).thenReturn(Collections.emptyList());
     storage = new InMemStorage();
     stateManager = spy(new SyncStateManager());
-    toTest = new ExecutionPreparationHandler(storage, stateManager, dockerImageValidator, executionGate);
+    toTest = new ExecutionPreparationHandler(storage, stateManager, dockerImageValidator);
   }
 
   @Test
@@ -167,7 +165,7 @@ public class ExecutionPreparationHandlerTest {
     storageSpy.storeWorkflow(workflow);
     storageSpy.patchState(workflow.id(), workflowState);
 
-    toTest = new ExecutionPreparationHandler(storageSpy, stateManager, dockerImageValidator, executionGate);
+    toTest = new ExecutionPreparationHandler(storageSpy, stateManager, dockerImageValidator);
 
     RunState runState = RunState.fresh(workflowInstance, toTest);
 
@@ -273,22 +271,6 @@ public class ExecutionPreparationHandlerTest {
 
     assertThat(currentState.state(), is(PREPARE));
     assertFalse(data.executionDescription().isPresent());
-  }
-
-  @Test
-  public void shouldRetryLaterIfMissingDependencies() throws Exception {
-    when(executionGate.missingDependencies(any(), any(), any())).thenReturn(ImmutableList.of("foo", "bar"));
-
-    Workflow workflow = Workflow.create("id", FULL_WORKFLOW_CONFIGURATION);
-    WorkflowInstance workflowInstance = WorkflowInstance.create(workflow.id(), "2016-03-14T15");
-    RunState runState = RunState.create(workflowInstance, RunState.State.PREPARE);
-
-    storage.storeWorkflow(workflow);
-    stateManager.initialize(runState);
-    toTest.transitionInto(runState);
-
-    verify(stateManager).receive(Event.info(workflowInstance, Message.info("Missing dependencies: foo, bar")));
-    verify(stateManager).receive(Event.retryAfter(workflowInstance, TimeUnit.MINUTES.toMillis(10)));
   }
 
   private WorkflowConfiguration schedule(String... args) {

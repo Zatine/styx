@@ -31,16 +31,21 @@ import static org.mockito.Matchers.anySetOf;
 import static org.mockito.Matchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.RateLimiter;
 import com.spotify.styx.model.Event;
 import com.spotify.styx.model.Resource;
 import com.spotify.styx.model.Schedule;
+import com.spotify.styx.model.SequenceEvent;
 import com.spotify.styx.model.Workflow;
 import com.spotify.styx.model.WorkflowConfiguration;
 import com.spotify.styx.model.WorkflowId;
@@ -54,16 +59,21 @@ import com.spotify.styx.state.StateManager;
 import com.spotify.styx.state.SyncStateManager;
 import com.spotify.styx.state.TimeoutConfig;
 import com.spotify.styx.storage.Storage;
+import com.spotify.styx.testdata.TestData;
 import com.spotify.styx.util.IsClosedException;
 import com.spotify.styx.util.Time;
 import java.io.IOException;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.SortedSet;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -101,9 +111,14 @@ public class SchedulerTest {
 
   @Mock Stats stats;
 
+  @Mock WorkflowExecutionGate gate;
+
   @Before
   public void setUp() throws Exception {
     when(rateLimiter.tryAcquire()).thenReturn(true);
+
+    when(gate.missingDependencies(any(), any(), any()))
+        .thenReturn(WorkflowExecutionGate.NO_MISSING_DEPS);
   }
 
   @After
@@ -111,7 +126,7 @@ public class SchedulerTest {
     executor.shutdownNow();
   }
 
-  private void setUp(int timeoutSeconds) throws IsClosedException, IOException {
+  private void setUp(long timeoutSeconds) throws IsClosedException, IOException {
     workflowCache = new InMemWorkflowCache();
     TimeoutConfig timeoutConfig = createWithDefaultTtl(ofSeconds(timeoutSeconds));
 
@@ -125,7 +140,7 @@ public class SchedulerTest {
 
     stateManager = Mockito.spy(new SyncStateManager());
     scheduler = new Scheduler(time, timeoutConfig, stateManager, workflowCache, storage, resourceDecorator,
-                              stats, rateLimiter);
+                              stats, rateLimiter, gate);
   }
 
   private void setResourceLimit(String resourceId, long limit) {
@@ -563,6 +578,100 @@ public class SchedulerTest {
 
     assertThat(countInState(State.QUEUED), is(1));
   }
+
+  @Test
+  public void shouldRetryLaterIfMissingDependencies() throws Exception {
+    when(gate.missingDependencies(any(), any(), any())).thenReturn(
+        CompletableFuture.completedFuture(ImmutableList.of("foo", "bar")));
+
+    final Workflow workflow = workflowUsingResources(WORKFLOW_ID1);
+
+    setUp(TimeUnit.DAYS.toSeconds(2));
+    initWorkflow(workflow);
+
+    final StateData stateData = StateData.newBuilder().tries(0).build();
+    final RunState runState = RunState.create(INSTANCE, State.QUEUED, stateData, time);
+
+    init(runState);
+
+    scheduler.tick();
+
+    verify(gate).missingDependencies(INSTANCE, workflow.configuration(), runState);
+    verify(stateManager).receive(Event.info(INSTANCE, Message.info("Missing dependencies: foo, bar")));
+    verify(stateManager).receive(Event.retryAfter(INSTANCE, TimeUnit.MINUTES.toMillis(10)));
+    verify(stateManager, never()).receive(Event.dequeue(INSTANCE));
+
+    now = now.plus(Duration.ofMinutes(10));
+    when(gate.missingDependencies(any(), any(), any())).thenReturn(
+        WorkflowExecutionGate.NO_MISSING_DEPS);
+
+    scheduler.tick();
+
+    verify(stateManager).receive(Event.dequeue(INSTANCE));
+  }
+
+
+  @Test
+  public void shouldNotCheckDependenciesIfLastDequeueIsMoreThanAScheduleIntervalAgo() throws Exception {
+
+    setUp(TimeUnit.DAYS.toSeconds(2));
+
+    final Schedule schedule = Schedule.DAYS;
+    final Duration scheduleInterval = Duration.ofDays(1);
+
+    final Workflow workflow = Workflow.create(
+        WORKFLOW_ID1.componentId(),
+        WorkflowConfiguration.builder()
+            .id(WORKFLOW_ID1.id())
+            .schedule(schedule)
+            .resources(new String[]{})
+            .build());
+
+    initWorkflow(workflow);
+
+    final StateData stateData = StateData.newBuilder().tries(0).build();
+    final RunState runState = RunState.create(INSTANCE, State.QUEUED, stateData, time);
+
+    final SortedSet<SequenceEvent> events = Sets.newTreeSet(SequenceEvent.COUNTER_COMPARATOR);
+
+    events.addAll(ImmutableList.of(
+        SequenceEvent.create(Event.dequeue(INSTANCE), 0, now.toEpochMilli() + 0),
+        SequenceEvent.create(Event.submit(INSTANCE, TestData.EXECUTION_DESCRIPTION, "e1"), 1, now.toEpochMilli() + 1),
+        SequenceEvent.create(Event.submitted(INSTANCE, "e1"), 2, now.toEpochMilli() + 2),
+        SequenceEvent.create(Event.started(INSTANCE), 3, now.toEpochMilli() + 3),
+        SequenceEvent.create(Event.terminate(INSTANCE, Optional.of(20)), 4, now.toEpochMilli() + 4),
+        SequenceEvent.create(Event.retryAfter(INSTANCE, TimeUnit.MINUTES.toMillis(10)), 5, now.toEpochMilli() + 5)
+    ));
+
+    stateManager.initialize(runState);
+    for (SequenceEvent event : events) {
+     stateManager.receiveIgnoreClosed(event.event());
+    }
+    reset(stateManager);
+
+    when(storage.readEvents(INSTANCE)).thenReturn(events);
+
+    when(gate.missingDependencies(any(), any(), any())).thenReturn(
+        CompletableFuture.completedFuture(ImmutableList.of("foo", "bar")));
+
+    now = now.plus(Duration.ofMinutes(20));
+
+    scheduler.tick();
+
+    verify(gate).missingDependencies(eq(INSTANCE), eq(workflow.configuration()), any(RunState.class));
+    verify(stateManager).receive(Event.info(INSTANCE, Message.info("Missing dependencies: foo, bar")));
+    verify(stateManager).receive(Event.retryAfter(INSTANCE, TimeUnit.MINUTES.toMillis(10)));
+    verify(stateManager, never()).receive(Event.dequeue(INSTANCE));
+
+    now = now.plus(scheduleInterval);
+
+    scheduler.tick();
+
+    verifyNoMoreInteractions(gate);
+
+    verify(stateManager).receive(Event.dequeue(INSTANCE));
+  }
+
 
 
   private WorkflowInstance instance(WorkflowId id, String instanceId) {
